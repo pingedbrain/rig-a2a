@@ -42,6 +42,8 @@ mod client;
 #[cfg(not(target_family = "wasm"))]
 mod executor;
 #[cfg(not(target_family = "wasm"))]
+mod history;
+#[cfg(not(target_family = "wasm"))]
 mod parts;
 #[cfg(not(target_family = "wasm"))]
 mod server;
@@ -54,7 +56,9 @@ pub use client::{
     ReplyEvent,
 };
 #[cfg(not(target_family = "wasm"))]
-pub use executor::{A2aExecutor, DEFAULT_MAX_CONTEXTS};
+pub use executor::A2aExecutor;
+#[cfg(not(target_family = "wasm"))]
+pub use history::{DEFAULT_HISTORY_TOKENS, DEFAULT_MAX_CONTEXTS};
 #[cfg(not(target_family = "wasm"))]
 pub use server::{A2aServer, JSONRPC_PATH, REST_PATH};
 #[cfg(not(target_family = "wasm"))]
@@ -72,6 +76,9 @@ pub use a2a_server;
 /// The Axum version the router is built with, for `axum::serve`.
 #[cfg(not(target_family = "wasm"))]
 pub use axum;
+/// The session stores and history windows conversations are kept with.
+#[cfg(not(target_family = "wasm"))]
+pub use rig_memory;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests;

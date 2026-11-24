@@ -1,6 +1,6 @@
 //! A Rig agent as an A2A agent executor.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use a2a::{
@@ -13,91 +13,81 @@ use futures::stream::{AbortHandle, Abortable, BoxStream};
 use rig_agent::Agent;
 use rig_agent::agent::MultiTurnStreamItem;
 use rig_core::streaming::{Item, StreamEvent};
+use rig_memory::AsyncStore;
+use rig_memory::recent::{Recent, TokenBudget, view};
 
+use crate::history::{
+    DEFAULT_HISTORY_TOKENS, DEFAULT_MAX_CONTEXTS, HistoryStore, InMemory, Persistent,
+    valid_context_id,
+};
 use crate::parts::user_message;
 
 /// The id of the text artifact each task's reply streams into.
 const RESPONSE_ARTIFACT: &str = "response";
 
-/// How many conversations an executor remembers by default.
-pub const DEFAULT_MAX_CONTEXTS: usize = 1_000;
-
-type Contexts = Arc<Mutex<History>>;
 type Running = Arc<Mutex<HashMap<TaskId, AbortHandle>>>;
 
 /// A Rig [`Agent`] as an A2A [`AgentExecutor`].
 ///
 /// Each execution prompts the agent with the incoming message and the history
 /// of its `contextId`, streams the reply's text into one artifact, and ends the
-/// task completed, failed, or rejected when a part has no Rig content kind.
-/// A completed run's messages join the context's history, which is kept in
-/// memory and shared by the executor's clones. At most
-/// [`max_contexts`](Self::max_contexts) conversations are kept; starting one
-/// more forgets the oldest. Cancelling a task drops its run.
+/// task completed, failed, or rejected when a part has no Rig content kind or
+/// the `contextId` is not 1 to 128 ASCII letters, digits, `-` or `_`. A
+/// completed run's messages join the context's history; see
+/// [`history_store`](Self::history_store) and
+/// [`history_window`](Self::history_window) for where it lives and how much
+/// of it the model sees. Cancelling a task drops its run.
 #[derive(Clone)]
 pub struct A2aExecutor {
     agent: Agent,
-    contexts: Contexts,
+    history: Arc<dyn HistoryStore>,
+    window: Arc<dyn Recent>,
     running: Running,
 }
 
 impl A2aExecutor {
-    /// An executor that answers every task with `agent`.
+    /// An executor that answers every task with `agent`, keeping
+    /// conversations in memory.
     pub fn new(agent: Agent) -> Self {
         Self {
             agent,
-            contexts: Arc::new(Mutex::new(History::new(DEFAULT_MAX_CONTEXTS))),
+            history: Arc::new(InMemory::new(DEFAULT_MAX_CONTEXTS)),
+            window: Arc::new(TokenBudget::new(DEFAULT_HISTORY_TOKENS)),
             running: Arc::default(),
         }
     }
 
-    /// Remember at most `max` conversations (at least one); the oldest one
-    /// started is forgotten first. Defaults to [`DEFAULT_MAX_CONTEXTS`].
+    /// Keep conversations in memory, at most `max` of them (at least one);
+    /// the oldest one started is forgotten first. This is the default, with
+    /// [`DEFAULT_MAX_CONTEXTS`]; it replaces a [`history_store`](Self::history_store).
     #[must_use]
-    pub fn max_contexts(self, max: usize) -> Self {
-        lock(&self.contexts).max = max.max(1);
+    pub fn max_contexts(mut self, max: usize) -> Self {
+        self.history = Arc::new(InMemory::new(max));
         self
     }
-}
 
-/// Conversation histories by `contextId`, bounded in count.
-// ponytail: FIFO eviction by start time; switch to LRU if long-lived contexts get evicted while active.
-struct History {
-    by_context: HashMap<String, Vec<rig_core::message::Message>>,
-    started: VecDeque<String>,
-    max: usize,
-}
-
-impl History {
-    fn new(max: usize) -> Self {
-        Self {
-            by_context: HashMap::new(),
-            started: VecDeque::new(),
-            max,
-        }
+    /// Keep conversations in `store`, one session log per `contextId`, so
+    /// they survive restarts and several servers can share them: any
+    /// [`rig_memory`] store, such as `rig_memory::DirStore` (feature `fs`)
+    /// or the `rig-sqlite` and `rig-postgres` stores. Two servers saving one
+    /// conversation at once do not lose either turn.
+    #[must_use]
+    pub fn history_store<S>(mut self, store: S) -> Self
+    where
+        S: AsyncStore + Send + Sync + 'static,
+    {
+        self.history = Arc::new(Persistent(store));
+        self
     }
 
-    fn get(&self, context: &str) -> Vec<rig_core::message::Message> {
-        self.by_context.get(context).cloned().unwrap_or_default()
-    }
-
-    fn append(
-        &mut self,
-        context: &str,
-        messages: impl IntoIterator<Item = rig_core::message::Message>,
-    ) {
-        if !self.by_context.contains_key(context) {
-            self.started.push_back(context.to_owned());
-            while self.started.len() > self.max {
-                if let Some(oldest) = self.started.pop_front() {
-                    self.by_context.remove(&oldest);
-                }
-            }
-        }
-        self.by_context
-            .entry(context.to_owned())
-            .or_default()
-            .extend(messages);
+    /// Which newest messages of a conversation each request sends the
+    /// model, such as `rig_memory::recent::TokenBudget::new(8_000)` or
+    /// `LastMessages(20)`. Defaults to [`DEFAULT_HISTORY_TOKENS`] tokens. A
+    /// tool result is never sent without its call.
+    #[must_use]
+    pub fn history_window(mut self, window: impl Recent + 'static) -> Self {
+        self.window = Arc::new(window);
+        self
     }
 }
 
@@ -112,12 +102,7 @@ impl AgentExecutor for A2aExecutor {
             running: Arc::clone(&self.running),
             task_id: ctx.task_id.clone(),
         };
-        let run = run(
-            self.agent.clone(),
-            Arc::clone(&self.contexts),
-            ctx,
-            registered,
-        );
+        let run = run(self.clone(), ctx, registered);
         Abortable::new(run, registration).boxed()
     }
 
@@ -146,8 +131,7 @@ impl Drop for Registered {
 }
 
 fn run(
-    agent: Agent,
-    contexts: Contexts,
+    executor: A2aExecutor,
     ctx: ExecutorContext,
     registered: Registered,
 ) -> impl futures::Stream<Item = Result<StreamResponse, A2AError>> + Send + 'static {
@@ -168,6 +152,13 @@ fn run(
         if history.last().map(|last| &last.message_id) != Some(&message.message_id) {
             history.push(message.clone());
         }
+        if !valid_context_id(&ids.context) {
+            let reason = ids.agent_message(
+                "contextId must be 1 to 128 ASCII letters, digits, `-` or `_`.",
+            );
+            yield Ok(StreamResponse::Task(ids.task(TaskState::Rejected, Some(reason), history)));
+            return;
+        }
         let prompt = match user_message(&message) {
             Ok(prompt) => prompt,
             Err(unsupported) => {
@@ -178,8 +169,18 @@ fn run(
         };
         yield Ok(StreamResponse::Task(ids.task(TaskState::Working, None, history)));
 
-        let prior = lock(&contexts).get(&ids.context);
-        let mut stream = agent.prompt(prompt).history(prior).stream();
+        let prior = match executor.history.load(&ids.context).await {
+            Ok(messages) => view(&messages, executor.window.as_ref())
+                .iter()
+                .map(|message| (**message).clone())
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!(context_id = %ids.context, %error, "could not load the conversation");
+                yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The conversation could not be loaded."))));
+                return;
+            }
+        };
+        let mut stream = executor.agent.prompt(prompt).history(prior).stream();
         let mut streamed = false;
         while let Some(item) = stream.next().await {
             match item {
@@ -191,7 +192,11 @@ fn run(
                     streamed = true;
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                    lock(&contexts).append(&ids.context, response.messages.iter().cloned());
+                    // The answer stands even if the history cannot be saved;
+                    // the next turn then starts without this one.
+                    if let Err(error) = executor.history.append(&ids.context, response.messages.clone()).await {
+                        tracing::warn!(context_id = %ids.context, %error, "could not save the conversation");
+                    }
                     // The final answer replaces the streamed text, which can
                     // include retried turns and text written before tool calls.
                     yield Ok(ids.chunk(response.output(), false, true));
@@ -281,23 +286,4 @@ fn status(state: TaskState, message: Option<Message>) -> TaskStatus {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::History;
-
-    #[test]
-    fn history_forgets_the_oldest_context_past_the_limit() {
-        let mut history = History::new(2);
-        let hi = || [rig_core::message::Message::user("hi")];
-        history.append("a", hi());
-        history.append("b", hi());
-        history.append("a", hi()); // an existing context does not count again
-        assert_eq!(history.get("a").len(), 2);
-        history.append("c", hi());
-        assert!(history.get("a").is_empty(), "oldest context forgotten");
-        assert_eq!(history.get("b").len(), 1);
-        assert_eq!(history.get("c").len(), 1);
-    }
 }

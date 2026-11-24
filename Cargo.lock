@@ -1881,6 +1881,7 @@ dependencies = [
  "reqwest",
  "rig-agent",
  "rig-core",
+ "rig-memory",
  "serde",
  "serde_json",
  "thiserror",

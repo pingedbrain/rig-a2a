@@ -80,6 +80,25 @@ impl<S: TaskStore> A2aServer<S> {
         self
     }
 
+    /// Keep conversations in a [`rig_memory`] store; see
+    /// [`A2aExecutor::history_store`].
+    #[must_use]
+    pub fn history_store<T>(mut self, store: T) -> Self
+    where
+        T: rig_memory::AsyncStore + Send + Sync + 'static,
+    {
+        self.executor = self.executor.history_store(store);
+        self
+    }
+
+    /// How much of a conversation each request sends; see
+    /// [`A2aExecutor::history_window`].
+    #[must_use]
+    pub fn history_window(mut self, window: impl rig_memory::recent::Recent + 'static) -> Self {
+        self.executor = self.executor.history_window(window);
+        self
+    }
+
     /// Require `Authorization: Bearer <token>` on every call. The agent
     /// cards stay public, as discovery needs them, and declare the scheme;
     /// calls without the token get HTTP 401.
