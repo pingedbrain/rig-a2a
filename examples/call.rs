@@ -17,7 +17,9 @@ use rig_a2a::{RemoteAgent, ReplyEvent};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let url = args.next().context("usage: call <url> <text> [--token T] [--expect TEXT]")?;
+    let url = args
+        .next()
+        .context("usage: call <url> <text> [--token T] [--expect TEXT]")?;
     let text = args.next().context("missing the message text")?;
     let (mut token, mut expect) = (None, None);
     while let Some(flag) = args.next() {
@@ -57,7 +59,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(expected) = expect
         && !reply.text.contains(&expected)
     {
-        bail!("expected the answer to contain {expected:?}, got {:?}", reply.text);
+        bail!(
+            "expected the answer to contain {expected:?}, got {:?}",
+            reply.text
+        );
     }
     Ok(())
 }
