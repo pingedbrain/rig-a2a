@@ -56,11 +56,11 @@ pub use client::{
     ReplyEvent,
 };
 #[cfg(not(target_family = "wasm"))]
-pub use executor::A2aExecutor;
+pub use executor::{A2aExecutor, DEFAULT_MAX_CONCURRENT_TASKS, DEFAULT_MAX_RUN_DURATION};
 #[cfg(not(target_family = "wasm"))]
 pub use history::{DEFAULT_HISTORY_TOKENS, DEFAULT_MAX_CONTEXTS};
 #[cfg(not(target_family = "wasm"))]
-pub use server::{A2aServer, JSONRPC_PATH, REST_PATH};
+pub use server::{A2aServer, DEFAULT_MAX_REQUEST_BYTES, JSONRPC_PATH, REST_PATH};
 #[cfg(not(target_family = "wasm"))]
 pub use v03::V03_PATH;
 

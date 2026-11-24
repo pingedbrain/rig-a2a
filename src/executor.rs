@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use a2a::{
     A2AError, Artifact, Message, Part, Role, StreamResponse, Task, TaskArtifactUpdateEvent, TaskId,
@@ -25,6 +26,11 @@ use crate::parts::user_message;
 /// The id of the text artifact each task's reply streams into.
 const RESPONSE_ARTIFACT: &str = "response";
 
+/// How many tasks run at once by default; more are rejected as busy.
+pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 32;
+/// How long one run may take by default before it is stopped.
+pub const DEFAULT_MAX_RUN_DURATION: Duration = Duration::from_secs(600);
+
 type Running = Arc<Mutex<HashMap<TaskId, AbortHandle>>>;
 
 /// A Rig [`Agent`] as an A2A [`AgentExecutor`].
@@ -37,12 +43,19 @@ type Running = Arc<Mutex<HashMap<TaskId, AbortHandle>>>;
 /// [`history_store`](Self::history_store) and
 /// [`history_window`](Self::history_window) for where it lives and how much
 /// of it the model sees. Cancelling a task drops its run.
+///
+/// Every task spends model tokens, so an executor bounds them: at most
+/// [`max_concurrent_tasks`](Self::max_concurrent_tasks) run at once (more are
+/// rejected as busy, before any model call) and each stops after
+/// [`max_run_duration`](Self::max_run_duration).
 #[derive(Clone)]
 pub struct A2aExecutor {
     agent: Agent,
     history: Arc<dyn HistoryStore>,
     window: Arc<dyn Recent>,
     running: Running,
+    slots: Arc<tokio::sync::Semaphore>,
+    max_run: Duration,
 }
 
 impl A2aExecutor {
@@ -54,7 +67,26 @@ impl A2aExecutor {
             history: Arc::new(InMemory::new(DEFAULT_MAX_CONTEXTS)),
             window: Arc::new(TokenBudget::new(DEFAULT_HISTORY_TOKENS)),
             running: Arc::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_TASKS)),
+            max_run: DEFAULT_MAX_RUN_DURATION,
         }
+    }
+
+    /// Run at most `max` tasks at once (at least one); a task beyond that is
+    /// rejected as busy before it reaches the model. Defaults to
+    /// [`DEFAULT_MAX_CONCURRENT_TASKS`].
+    #[must_use]
+    pub fn max_concurrent_tasks(mut self, max: usize) -> Self {
+        self.slots = Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+        self
+    }
+
+    /// Stop a run that takes longer than `max`, failing its task. Defaults to
+    /// [`DEFAULT_MAX_RUN_DURATION`].
+    #[must_use]
+    pub fn max_run_duration(mut self, max: Duration) -> Self {
+        self.max_run = max;
+        self
     }
 
     /// Keep conversations in memory, at most `max` of them (at least one);
@@ -167,6 +199,12 @@ fn run(
                 return;
             }
         };
+        // Held until the run ends, however it ends (an abort drops it too).
+        let Ok(_slot) = Arc::clone(&executor.slots).try_acquire_owned() else {
+            let reason = ids.agent_message("The agent is busy; try again shortly.");
+            yield Ok(StreamResponse::Task(ids.task(TaskState::Rejected, Some(reason), history)));
+            return;
+        };
         yield Ok(StreamResponse::Task(ids.task(TaskState::Working, None, history)));
 
         let prior = match executor.history.load(&ids.context).await {
@@ -180,9 +218,19 @@ fn run(
                 return;
             }
         };
+        let deadline = tokio::time::Instant::now() + executor.max_run;
         let mut stream = executor.agent.prompt(prompt).history(prior).stream();
         let mut streamed = false;
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(task_id = %ids.task, max = ?executor.max_run, "A2A run took too long");
+                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run took longer than allowed."))));
+                    return;
+                }
+            };
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
                     text,

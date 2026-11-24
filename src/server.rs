@@ -41,7 +41,11 @@ pub struct A2aServer<S = InMemoryTaskStore> {
     store: S,
     url: String,
     bearer: Option<String>,
+    max_request_bytes: usize,
 }
+
+/// The largest request body a server reads by default: 2 MiB.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 impl A2aServer {
     /// Serve `agent` at `url`, the base URL clients reach this server at.
@@ -57,6 +61,7 @@ impl A2aServer {
             store: InMemoryTaskStore::new(),
             url,
             bearer: None,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 }
@@ -99,6 +104,28 @@ impl<S: TaskStore> A2aServer<S> {
         self
     }
 
+    /// Run at most `max` tasks at once; see [`A2aExecutor::max_concurrent_tasks`].
+    #[must_use]
+    pub fn max_concurrent_tasks(mut self, max: usize) -> Self {
+        self.executor = self.executor.max_concurrent_tasks(max);
+        self
+    }
+
+    /// Stop runs longer than `max`; see [`A2aExecutor::max_run_duration`].
+    #[must_use]
+    pub fn max_run_duration(mut self, max: std::time::Duration) -> Self {
+        self.executor = self.executor.max_run_duration(max);
+        self
+    }
+
+    /// Refuse request bodies over `bytes` with HTTP 413. Defaults to
+    /// [`DEFAULT_MAX_REQUEST_BYTES`].
+    #[must_use]
+    pub fn max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes;
+        self
+    }
+
     /// Require `Authorization: Bearer <token>` on every call. The agent
     /// cards stay public, as discovery needs them, and declare the scheme;
     /// calls without the token get HTTP 401.
@@ -123,6 +150,7 @@ impl<S: TaskStore> A2aServer<S> {
             store,
             url: self.url,
             bearer: self.bearer,
+            max_request_bytes: self.max_request_bytes,
         }
     }
 
@@ -149,7 +177,11 @@ impl<S: TaskStore> A2aServer<S> {
             .nest(JSONRPC_PATH, jsonrpc_router(Arc::clone(&handler)))
             .nest(REST_PATH, rest_router(Arc::clone(&handler)))
             .nest(V03_PATH, v03::router(handler))
-            .route_layer(auth);
+            .route_layer(auth)
+            // At the body itself, so it holds whichever way a handler reads it.
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                self.max_request_bytes,
+            ));
         // The cards are routed after the guard, so discovery needs no token.
         calls
             .merge(agent_card_router(Arc::new(StaticAgentCard::new(self.card))))
