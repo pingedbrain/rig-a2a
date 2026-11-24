@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "rig-a2a"
-version = "0.1.0"
+version = "0.47.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -1882,6 +1882,7 @@ dependencies = [
  "rig-agent",
  "rig-core",
  "rig-memory",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",

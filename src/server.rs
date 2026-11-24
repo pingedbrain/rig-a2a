@@ -85,6 +85,33 @@ impl<S: TaskStore> A2aServer<S> {
         self
     }
 
+    /// Answer every task with a `T` as JSON; see [`A2aExecutor::typed`]. The
+    /// card then declares `application/json` output and, in each skill's
+    /// description, the JSON schema of `T`, for callers to know what comes back.
+    #[must_use]
+    pub fn typed<T>(mut self) -> Self
+    where
+        T: schemars::JsonSchema
+            + serde::de::DeserializeOwned
+            + serde::Serialize
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.executor = self.executor.typed::<T>();
+        let schema = serde_json::to_string(&schemars::schema_for!(T)).unwrap_or_default();
+        let json = vec!["application/json".to_owned()];
+        self.card.default_output_modes = json.clone();
+        for skill in &mut self.card.skills {
+            skill.output_modes = Some(json.clone());
+            skill.description = format!(
+                "{} Answers with JSON matching this schema: {schema}",
+                skill.description
+            );
+        }
+        self
+    }
+
     /// Keep conversations in a [`rig_memory`] store; see
     /// [`A2aExecutor::history_store`].
     #[must_use]

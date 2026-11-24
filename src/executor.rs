@@ -9,10 +9,14 @@ use a2a::{
     TaskState, TaskStatus, TaskStatusUpdateEvent, new_message_id,
 };
 use a2a_server::{AgentExecutor, ExecutorContext};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::{AbortHandle, Abortable, BoxStream};
 use rig_agent::Agent;
 use rig_agent::agent::MultiTurnStreamItem;
+use rig_core::message::{AssistantContent, DocumentSourceKind, MimeType};
 use rig_core::streaming::{Item, StreamEvent};
 use rig_memory::AsyncStore;
 use rig_memory::recent::{Recent, TokenBudget, view};
@@ -32,6 +36,20 @@ pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 32;
 pub const DEFAULT_MAX_RUN_DURATION: Duration = Duration::from_secs(600);
 
 type Running = Arc<Mutex<HashMap<TaskId, AbortHandle>>>;
+
+/// A typed run, erased: the agent, the prompt and the history in; the answer
+/// as JSON and the run's transcript out.
+type TypedAnswer = Arc<
+    dyn Fn(
+            Agent,
+            rig_core::message::Message,
+            Vec<rig_core::message::Message>,
+        ) -> BoxFuture<
+            'static,
+            Result<(serde_json::Value, Vec<rig_core::message::Message>), String>,
+        > + Send
+        + Sync,
+>;
 
 /// A Rig [`Agent`] as an A2A [`AgentExecutor`].
 ///
@@ -56,6 +74,7 @@ pub struct A2aExecutor {
     running: Running,
     slots: Arc<tokio::sync::Semaphore>,
     max_run: Duration,
+    typed: Option<TypedAnswer>,
 }
 
 impl A2aExecutor {
@@ -69,7 +88,38 @@ impl A2aExecutor {
             running: Arc::default(),
             slots: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_TASKS)),
             max_run: DEFAULT_MAX_RUN_DURATION,
+            typed: None,
         }
+    }
+
+    /// Answer every task with a `T`, as one JSON data part: the agent runs
+    /// as [`Agent::prompt_typed`] does (with the conversation's history, and
+    /// two retries when the model's JSON does not parse as `T`). Use it to
+    /// serve an extractor or any agent whose callers want data, not prose.
+    #[must_use]
+    pub fn typed<T>(mut self) -> Self
+    where
+        T: schemars::JsonSchema
+            + serde::de::DeserializeOwned
+            + serde::Serialize
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.typed = Some(Arc::new(|agent, prompt, history| {
+            Box::pin(async move {
+                let response = agent
+                    .prompt_typed::<T>(prompt)
+                    .history(history)
+                    .retries(2)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let value =
+                    serde_json::to_value(&response.output).map_err(|error| error.to_string())?;
+                Ok((value, response.messages))
+            })
+        }));
+        self
     }
 
     /// Run at most `max` tasks at once (at least one); a task beyond that is
@@ -173,7 +223,19 @@ fn run(
             task: ctx.task_id,
             context: ctx.context_id,
         };
+        // The task's span: the agent's own spans (model calls, tools) nest
+        // under it, and it records how the task ended.
+        let span = tracing::info_span!(
+            "a2a.task",
+            a2a.task_id = %ids.task,
+            a2a.context_id = %ids.context,
+            a2a.state = tracing::field::Empty,
+        );
+        let end = |state: &'static str| {
+            span.record("a2a.state", state);
+        };
         let Some(message) = ctx.message else {
+            end("failed");
             yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("No message to answer."))));
             return;
         };
@@ -188,6 +250,7 @@ fn run(
             let reason = ids.agent_message(
                 "contextId must be 1 to 128 ASCII letters, digits, `-` or `_`.",
             );
+            end("rejected");
             yield Ok(StreamResponse::Task(ids.task(TaskState::Rejected, Some(reason), history)));
             return;
         }
@@ -195,6 +258,7 @@ fn run(
             Ok(prompt) => prompt,
             Err(unsupported) => {
                 let reason = ids.agent_message(unsupported.to_string());
+                end("rejected");
                 yield Ok(StreamResponse::Task(ids.task(TaskState::Rejected, Some(reason), history)));
                 return;
             }
@@ -202,6 +266,7 @@ fn run(
         // Held until the run ends, however it ends (an abort drops it too).
         let Ok(_slot) = Arc::clone(&executor.slots).try_acquire_owned() else {
             let reason = ids.agent_message("The agent is busy; try again shortly.");
+            end("rejected_busy");
             yield Ok(StreamResponse::Task(ids.task(TaskState::Rejected, Some(reason), history)));
             return;
         };
@@ -213,20 +278,48 @@ fn run(
                 .map(|message| (**message).clone())
                 .collect::<Vec<_>>(),
             Err(error) => {
-                tracing::warn!(context_id = %ids.context, %error, "could not load the conversation");
+                tracing::warn!(parent: &span, %error, "could not load the conversation");
+                end("failed");
                 yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The conversation could not be loaded."))));
                 return;
             }
         };
         let deadline = tokio::time::Instant::now() + executor.max_run;
-        let mut stream = executor.agent.prompt(prompt).history(prior).stream();
+        if let Some(typed) = &executor.typed {
+            let answer = tracing::Instrument::instrument(typed(executor.agent.clone(), prompt, prior), span.clone());
+            match tokio::time::timeout_at(deadline, answer).await {
+                Err(_) => {
+                    end("failed_timeout");
+                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run took longer than allowed."))));
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(parent: &span, %error, "A2A typed task failed");
+                    end("failed");
+                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent could not produce a structured answer."))));
+                }
+                Ok(Ok((value, messages))) => {
+                    if let Err(error) = executor.history.append(&ids.context, messages).await {
+                        tracing::warn!(parent: &span, %error, "could not save the conversation");
+                    }
+                    let mut data = Part::text("");
+                    data.content = a2a::PartContent::Data(value);
+                    data.media_type = Some("application/json".to_owned());
+                    end("completed");
+                    yield Ok(ids.artifact(vec![data], false, true));
+                    yield Ok(ids.status(TaskState::Completed, None));
+                }
+            }
+            return;
+        }
+        let mut stream = span.in_scope(|| executor.agent.prompt(prompt).history(prior).stream());
         let mut streamed = false;
         loop {
             let item = match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(Some(item)) => item,
                 Ok(None) => break,
                 Err(_) => {
-                    tracing::warn!(task_id = %ids.task, max = ?executor.max_run, "A2A run took too long");
+                    tracing::warn!(parent: &span, max = ?executor.max_run, "A2A run took too long");
+                    end("failed_timeout");
                     yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run took longer than allowed."))));
                     return;
                 }
@@ -243,22 +336,25 @@ fn run(
                     // The answer stands even if the history cannot be saved;
                     // the next turn then starts without this one.
                     if let Err(error) = executor.history.append(&ids.context, response.messages.clone()).await {
-                        tracing::warn!(context_id = %ids.context, %error, "could not save the conversation");
+                        tracing::warn!(parent: &span, %error, "could not save the conversation");
                     }
                     // The final answer replaces the streamed text, which can
                     // include retried turns and text written before tool calls.
-                    yield Ok(ids.chunk(response.output(), false, true));
+                    end("completed");
+                    yield Ok(ids.artifact(answer_parts(&response.output(), &response.content), false, true));
                     yield Ok(ids.status(TaskState::Completed, None));
                     return;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(task_id = %ids.task, %error, "A2A task failed");
+                    tracing::warn!(parent: &span, %error, "A2A task failed");
+                    end("failed");
                     yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run failed."))));
                     return;
                 }
             }
         }
+        end("failed");
         yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run ended without an answer."))));
     }
 }
@@ -303,9 +399,14 @@ impl Ids {
         })
     }
 
-    /// A piece of the response artifact: appended to the pieces before it, or
-    /// replacing them when `append` is false.
+    /// A piece of text of the response artifact; see [`Self::artifact`].
     fn chunk(&self, text: String, append: bool, last_chunk: bool) -> StreamResponse {
+        self.artifact(vec![Part::text(text)], append, last_chunk)
+    }
+
+    /// Parts of the response artifact: appended to the parts before them, or
+    /// replacing them when `append` is false.
+    fn artifact(&self, parts: Vec<Part>, append: bool, last_chunk: bool) -> StreamResponse {
         StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
             task_id: self.task.clone(),
             context_id: self.context.clone(),
@@ -313,7 +414,7 @@ impl Ids {
                 artifact_id: RESPONSE_ARTIFACT.to_owned(),
                 name: Some(RESPONSE_ARTIFACT.to_owned()),
                 description: None,
-                parts: vec![Part::text(text)],
+                parts,
                 metadata: None,
                 extensions: None,
             },
@@ -322,6 +423,34 @@ impl Ids {
             metadata: None,
         })
     }
+}
+
+/// The final answer's parts: its text, then any image the model produced.
+fn answer_parts(text: &str, content: &[AssistantContent]) -> Vec<Part> {
+    let mut parts = vec![Part::text(text)];
+    for item in content {
+        let AssistantContent::Image(image) = item else {
+            continue;
+        };
+        let content = match &image.data {
+            DocumentSourceKind::Url(url) => a2a::PartContent::Url(url.clone()),
+            DocumentSourceKind::Raw(bytes) => a2a::PartContent::Raw(bytes.clone()),
+            DocumentSourceKind::Base64(data) => match BASE64.decode(data) {
+                Ok(bytes) => a2a::PartContent::Raw(bytes),
+                Err(_) => continue,
+            },
+            // A provider-side file id or nothing: no bytes to send.
+            _ => continue,
+        };
+        let mut part = Part::text("");
+        part.content = content;
+        part.media_type = image
+            .media_type
+            .as_ref()
+            .map(|kind| kind.to_mime_type().to_owned());
+        parts.push(part);
+    }
+    parts
 }
 
 fn status(state: TaskState, message: Option<Message>) -> TaskStatus {
@@ -334,4 +463,41 @@ fn status(state: TaskState, message: Option<Message>) -> TaskStatus {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use rig_core::message::{AssistantContent, DocumentSourceKind, Image, ImageMediaType};
+
+    use super::*;
+
+    #[test]
+    fn model_images_become_file_parts_after_the_text() {
+        let image = |data| {
+            AssistantContent::Image(Image {
+                data,
+                media_type: Some(ImageMediaType::PNG),
+                ..Default::default()
+            })
+        };
+        let content = [
+            AssistantContent::text("here"),
+            image(DocumentSourceKind::base64("aGk=")),
+            image(DocumentSourceKind::url("https://x/a.png")),
+            image(DocumentSourceKind::file_id("file-1")),
+        ];
+        let parts = answer_parts("here", &content);
+        assert_eq!(
+            parts.len(),
+            3,
+            "text, the decoded image, the URL image; no file id"
+        );
+        assert_eq!(parts[0].as_text(), Some("here"));
+        assert_eq!(parts[1].content, a2a::PartContent::Raw(b"hi".to_vec()));
+        assert_eq!(parts[1].media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            parts[2].content,
+            a2a::PartContent::Url("https://x/a.png".into())
+        );
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rig-a2a"
-version = "0.1.0"
+version = "0.47.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT"
@@ -21,6 +21,7 @@ a2a = { package = "a2a-lf", version = "0.4" }
 a2a-server = { package = "a2a-server-lf", version = "0.5" }
 a2a-client = { package = "a2a-client-lf", version = "0.2" }
 serde = { version = "1", features = ["derive"] }
+schemars = "1"
 serde_json = "1"
 base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
@@ -37,5 +38,6 @@ tower-http = { version = "0.6", features = ["limit"] }
 rig-agent = { version = "0.47", default-features = false, features = ["test-utils"] }
 rig-core = { version = "0.47", default-features = false, features = ["reqwest", "rustls", "test-utils"] }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

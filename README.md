@@ -66,19 +66,69 @@ finishes (a refused call, a dropped connection) is an error, never an empty answ
 Both ways agents stream are understood: artifact chunks (Rig, most SDKs) and
 `working` status messages followed by a final artifact (Strands).
 
-## Production knobs
+## Serving: what comes back
+
+A plain agent answers with text, streamed, plus any image the model produced as a
+file part. `A2aServer::typed::<T>()` serves an agent whose callers want data: every task
+runs as `prompt_typed::<T>` and answers with one JSON data part, and the card declares
+`application/json` output and the JSON schema of `T`.
 
 ```rust
-// Server: require a bearer token (cards stay public and declare it), cap memory.
-A2aServer::new(agent, url).bearer_token(token).max_contexts(500).into_router();
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct Task { title: String, priority: Priority }
 
-// Client: send the token, bound the wait (default 5 minutes).
+A2aServer::new(extractor_agent, url).typed::<Task>().into_router();
+```
+
+## Conversations
+
+Messages sharing a `contextId` share the agent's history. By default it lives in memory
+(at most 1000 conversations, oldest forgotten first). `history_store` keeps it in any
+[`rig-memory`](https://crates.io/crates/rig-memory) store (`DirStore` on disk,
+`rig-sqlite`, `rig-postgres`), so it survives restarts and replicas share it; two
+servers saving one conversation at once lose neither turn. Each request sends the model
+only the newest messages that fit `history_window` (32k tokens by default), never a tool
+result without its call. A `contextId` must be 1-128 of `[A-Za-z0-9_-]`, so a client
+cannot make it escape a file store.
+
+```rust
+A2aServer::new(agent, url)
+    .history_store(rig_memory::DirStore::new("./conversations"))
+    .history_window(rig_memory::recent::TokenBudget::new(16_000));
+```
+
+## Production knobs
+
+Every task spends model tokens, so an exposed agent is bounded by default:
+
+| Knob | Default | Beyond it |
+|---|---|---|
+| `max_concurrent_tasks` | 32 | rejected as busy, before any model call |
+| `max_run_duration` | 10 min | the run is stopped, the task fails |
+| `max_request_bytes` | 2 MiB | HTTP 413 |
+| `bearer_token` | none | HTTP 401 on every call (cards stay public) |
+
+```rust
+A2aServer::new(agent, url)
+    .bearer_token(token)
+    .max_concurrent_tasks(8)
+    .max_run_duration(Duration::from_secs(120));
+
 RemoteAgent::builder(url).bearer_token(token).timeout(Duration::from_secs(60)).connect().await?;
 ```
 
-Calls without the token get HTTP 401 on every binding and version. Conversation history
-lives in memory, at most `max_contexts` conversations (default 1000), oldest forgotten
-first.
+## Tracing
+
+Each task runs in an `a2a.task` span (`a2a.task_id`, `a2a.context_id`, and `a2a.state`
+recorded when it ends: `completed`, `failed`, `failed_timeout`, `rejected`,
+`rejected_busy`). Rig's own spans for the model calls and tools nest under it, so an
+OpenTelemetry backend shows each A2A task with everything it spent.
+
+## Not supported
+
+Push notifications (webhooks), the authenticated extended agent card, OAuth/OIDC
+schemes (bearer only; add your own Axum middleware for more), the gRPC binding, and
+files produced by tools (only the model's own images become file parts).
 
 ## Examples
 
