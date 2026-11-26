@@ -1,3 +1,5 @@
+> **Moved.** `rig-a2a` now lives in [pingedbrain/rig-contrib](https://github.com/pingedbrain/rig-contrib/tree/main/crates/rig-a2a), together with the other Rig companion crates. This repository is archived.
+
 # rig-a2a
 
 [Agent2Agent (A2A) protocol](https://a2a-protocol.org/latest/specification/) v1.0 for
