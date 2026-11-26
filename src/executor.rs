@@ -16,6 +16,7 @@ use futures::future::BoxFuture;
 use futures::stream::{AbortHandle, Abortable, BoxStream};
 use rig_agent::Agent;
 use rig_agent::agent::MultiTurnStreamItem;
+use rig_agent::completion::{PromptError, StructuredOutputError};
 use rig_core::message::{AssistantContent, DocumentSourceKind, MimeType};
 use rig_core::streaming::{Item, StreamEvent};
 use rig_memory::AsyncStore;
@@ -38,7 +39,7 @@ pub const DEFAULT_MAX_RUN_DURATION: Duration = Duration::from_secs(600);
 type Running = Arc<Mutex<HashMap<TaskId, AbortHandle>>>;
 
 /// A typed run, erased: the agent, the prompt and the history in; the answer
-/// as JSON and the run's transcript out.
+/// as JSON and the run's transcript out, or what to tell the caller.
 type TypedAnswer = Arc<
     dyn Fn(
             Agent,
@@ -113,7 +114,14 @@ impl A2aExecutor {
                     .history(history)
                     .retries(2)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| {
+                        tracing::warn!(%error, "A2A typed task failed");
+                        match &error {
+                            StructuredOutputError::Prompt(prompt) => failure_message(prompt),
+                            _ => "The agent could not produce a structured answer.",
+                        }
+                        .to_owned()
+                    })?;
                 let value =
                     serde_json::to_value(&response.output).map_err(|error| error.to_string())?;
                 Ok((value, response.messages))
@@ -292,10 +300,9 @@ fn run(
                     end("failed_timeout");
                     yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run took longer than allowed."))));
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(parent: &span, %error, "A2A typed task failed");
+                Ok(Err(reason)) => {
                     end("failed");
-                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent could not produce a structured answer."))));
+                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message(reason))));
                 }
                 Ok(Ok((value, messages))) => {
                     if let Err(error) = executor.history.append(&ids.context, messages).await {
@@ -349,7 +356,7 @@ fn run(
                 Err(error) => {
                     tracing::warn!(parent: &span, %error, "A2A task failed");
                     end("failed");
-                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message("The agent run failed."))));
+                    yield Ok(ids.status(TaskState::Failed, Some(ids.agent_message(failure_message(&error)))));
                     return;
                 }
             }
@@ -465,11 +472,66 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What the caller is told when a run fails: enough to decide whether to
+/// retry, without the provider's own error text (which can name internals).
+///
+/// A failure arrives as the provider's error from an awaited run, or as its
+/// report from a streamed one; both carry the status and whether to retry.
+fn failure_message(failure: &PromptError) -> &'static str {
+    let (status, retryable) = match failure {
+        PromptError::Provider(provider) => (
+            failure
+                .provider_response_status()
+                .map(|status| status.as_u16()),
+            provider.is_retryable(),
+        ),
+        PromptError::Report(report) => (
+            report.http_status.or(report
+                .provider_response_status()
+                .map(|status| status.as_u16())),
+            report.retryable,
+        ),
+        PromptError::MaxTurns { .. } => {
+            return "The agent used up its turns without finishing.";
+        }
+        _ => (None, false),
+    };
+    match status {
+        Some(429) => "The model provider is rate limiting this agent; try again in a moment.",
+        Some(401 | 403) => "The model provider rejected this agent's credentials.",
+        Some(500..=599) => "The model provider is unavailable right now; try again shortly.",
+        Some(_) => "The model provider rejected the request.",
+        None if retryable => "The model provider could not be reached; try again shortly.",
+        None => "The agent run failed.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rig_core::message::{AssistantContent, DocumentSourceKind, Image, ImageMediaType};
 
     use super::*;
+
+    #[test]
+    fn failures_are_classified_by_status_and_retryability() {
+        use rig_core::error::{ErrorKind, ErrorReport};
+        let report = |status: Option<u16>, retryable: bool| {
+            let mut report = ErrorReport::new(ErrorKind::ProviderResponse, "upstream said no")
+                .with_retryable(retryable);
+            if let Some(status) = status {
+                report = report.with_http_status(status);
+            }
+            PromptError::Report(report)
+        };
+        assert!(failure_message(&report(Some(429), true)).contains("rate limiting"));
+        assert!(failure_message(&report(Some(401), false)).contains("credentials"));
+        assert!(failure_message(&report(Some(503), true)).contains("unavailable"));
+        assert!(failure_message(&report(None, true)).contains("could not be reached"));
+        assert_eq!(
+            failure_message(&report(None, false)),
+            "The agent run failed."
+        );
+    }
 
     #[test]
     fn model_images_become_file_parts_after_the_text() {

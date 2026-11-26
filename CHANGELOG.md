@@ -10,6 +10,8 @@ First release.
   and cancel) and v0.3 (JSON-RPC under `/v03`, for Strands Agents 1.x and other v0.3
   peers), on the official A2A Rust SDK. Server adapted from 0xPlaygrounds/rig#2820.
 - `A2aServer::typed::<T>()`: answer with JSON data and declare its schema in the card.
+- A failed task says why in terms the caller can act on (rate limited, credentials
+  rejected, provider unavailable, out of turns), without the provider's error text.
   The model's images become file parts.
 - Conversations in memory or in any rig-memory store, windowed by token budget.
 - Limits: concurrent tasks, run duration, request size; bearer token auth.
